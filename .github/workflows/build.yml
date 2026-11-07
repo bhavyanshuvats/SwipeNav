@@ -1,0 +1,418 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle')"
+          cat > 'app/build.gradle' <<'EOF_FILE'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.bhavya.swipenav'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.bhavya.swipenav"
+                  minSdk 23
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.BLUETOOTH" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".GestureService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/java/com/bhavya/swipenav/ControlPanel.java')"
+          cat > 'app/src/main/java/com/bhavya/swipenav/ControlPanel.java' <<'EOF_FILE'
+          package com.bhavya.swipenav;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothProfile;
+          import android.content.ContentResolver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.graphics.drawable.GradientDrawable;
+          import android.hardware.camera2.CameraManager;
+          import android.media.AudioManager;
+          import android.net.Uri;
+          import android.net.wifi.WifiInfo;
+          import android.net.wifi.WifiManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.text.TextUtils;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+
+          import java.util.List;
+
+          public class ControlPanel {
+
+              private static class Tile {
+                  LinearLayout box;
+                  TextView title, sub;
+              }
+
+              private final AccessibilityService svc;
+              private final WindowManager wm;
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private FrameLayout root;
+              private boolean showing, torchOn;
+              private String btName;
+              private String btFound;
+              private int btPending;
+              private Tile wifi, bt, torch, rotate, data, plane, loc, sett, notif, power;
+
+              private final Runnable ticker = new Runnable() {
+                  @Override public void run() {
+                      if (!showing) return;
+                      refresh();
+                      h.postDelayed(this, 1500);
+                  }
+              };
+
+              public ControlPanel(AccessibilityService s) {
+                  svc = s;
+                  wm = (WindowManager) s.getSystemService(Context.WINDOW_SERVICE);
+              }
+
+              private int dp(int v) {
+                  return (int) (v * svc.getResources().getDisplayMetrics().density);
+              }
+
+              private GradientDrawable bg(int color, int radiusDp) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(color);
+                  g.setCornerRadius(dp(radiusDp));
+                  return g;
+              }
+
+              public void show() {
+                  if (showing) return;
+                  build();
+                  WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.MATCH_PARENT,
+                          WindowManager.LayoutParams.MATCH_PARENT,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                          PixelFormat.TRANSLUCENT);
+                  wm.addView(root, lp);
+                  showing = true;
+                  refresh();
+                  h.postDelayed(ticker, 1500);
+              }
+
+              public void hide() {
+                  if (!showing) return;
+                  showing = false;
+                  h.removeCallbacks(ticker);
+                  try { wm.removeView(root); } catch (Exception ignored) { }
+              }
+
+              private Tile makeTile(String title, View.OnClickListener tap, View.OnLongClickListener lp) {
+                  Tile t = new Tile();
+                  t.box = new LinearLayout(svc);
+                  t.box.setOrientation(LinearLayout.VERTICAL);
+                  t.box.setGravity(Gravity.CENTER_VERTICAL);
+                  t.box.setPadding(dp(12), 0, dp(12), 0);
+                  t.title = new TextView(svc);
+                  t.title.setText(title);
+                  t.title.setTextColor(Color.WHITE);
+                  t.title.setTextSize(15);
+                  t.title.setSingleLine(true);
+                  t.sub = new TextView(svc);
+                  t.sub.setTextColor(0xFFCCCCCC);
+                  t.sub.setTextSize(12);
+                  t.sub.setSingleLine(true);
+                  t.sub.setEllipsize(TextUtils.TruncateAt.END);
+                  t.box.addView(t.title);
+                  t.box.addView(t.sub);
+                  t.box.setOnClickListener(tap);
+                  if (lp != null) t.box.setOnLongClickListener(lp);
+                  setTile(t, false, "");
+                  return t;
+              }
+
+              private void setTile(Tile t, boolean on, String sub) {
+                  t.sub.setText(sub);
+                  t.box.setBackground(bg(on ? 0xFF2962FF : 0xFF3A3A3C, 16));
+              }
+
+              private void addRow(LinearLayout parent, Tile a, Tile b) {
+                  LinearLayout row = new LinearLayout(svc);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  for (Tile t : new Tile[]{a, b}) {
+                      LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(70), 1f);
+                      p.setMargins(dp(4), dp(4), dp(4), dp(4));
+                      row.addView(t.box, p);
+                  }
+                  parent.addView(row);
+              }
+
+              private void label(LinearLayout parent, String text) {
+                  TextView t = new TextView(svc);
+                  t.setText(text);
+                  t.setTextColor(0xFFCCCCCC);
+                  t.setTextSize(12);
+                  t.setPadding(dp(6), dp(8), 0, 0);
+                  parent.addView(t);
+              }
+
+              private void openSettings(String action) {
+                  try {
+                      Intent i = new Intent(action);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      svc.startActivity(i);
+                  } catch (Exception ignored) { }
+                  hide();
+              }
+
+              private void openWriteSettings() {
+                  try {
+                      Intent i = new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS,
+                              Uri.parse("package:" + svc.getPackageName()));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      svc.startActivity(i);
+                  } catch (Exception ignored) { }
+                  hide();
+              }
+
+              private void build() {
+                  final ContentResolver cr = svc.getContentResolver();
+                  root = new FrameLayout(svc);
+                  root.setBackgroundColor(0x99000000);
+                  root.setOnClickListener(new View.OnClickListener() {
+                      @Override public void onClick(View v) { hide(); }
+                  });
+
+                  LinearLayout panel = new LinearLayout(svc);
+                  panel.setOrientation(LinearLayout.VERTICAL);
+                  panel.setPadding(dp(10), dp(10), dp(10), dp(14));
+                  panel.setBackground(bg(0xF01C1C1E, 24));
+                  panel.setClickable(true);
+                  panel.setOnTouchListener(new View.OnTouchListener() {
+                      float y0;
+                      @Override public boolean onTouch(View v, MotionEvent e) {
+                          if (e.getActionMasked() == MotionEvent.ACTION_DOWN) y0 = e.getRawY();
+                          if (e.getActionMasked() == MotionEvent.ACTION_UP && y0 - e.getRawY() > dp(60)) hide();
+                          return true;
+                      }
+                  });
+                  FrameLayout.LayoutParams pp = new FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+                  pp.setMargins(dp(10), dp(30), dp(10), 0);
+                  root.addView(panel, pp);
+
+                  wifi = makeTile("Wi-Fi", new View.OnClickListener() {
+                      @Override public void onClick(View v) { toggleWifi(); }
+                  }, new View.OnLongClickListener() {
+                      @Override public boolean onLongClick(View v) { openSettings(Settings.ACTION_WIFI_SETTINGS); return true; }
+                  });
+                  bt = makeTile("Bluetooth", new View.OnClickListener() {
+                      @Override public void onClick(View v) { toggleBt(); }
+                  }, new View.OnLongClickListener() {
+                      @Override public boolean onLongClick(View v) { openSettings(Settings.ACTION_BLUETOOTH_SETTINGS); return true; }
+                  });
+                  torch = makeTile("Flashlight", new View.OnClickListener() {
+                      @Override public void onClick(View v) { toggleTorch(); }
+                  }, null);
+                  rotate = makeTile("Auto-rotate", new View.OnClickListener() {
+                      @Override public void onClick(View v) { toggleRotate(); }
+                  }, null);
+                  data = makeTile("Mobile data", new View.OnClickListener() {
+                      @Override public void onClick(View v) { openSettings(Settings.ACTION_WIRELESS_SETTINGS); }
+                  }, null);
+                  plane = makeTile("Airplane mode", new View.OnClickListener() {
+                      @Override public void onClick(View v) { openSettings(Settings.ACTION_AIRPLANE_MODE_SETTINGS); }
+                  }, null);
+                  loc = makeTile("Location", new View.OnClickListener() {
+                      @Override public void onClick(View v) { openSettings(Settings.ACTION_LOCATION_SOURCE_SETTINGS); }
+                  }, null);
+                  sett = makeTile("Settings", new View.OnClickListener() {
+                      @Override public void onClick(View v) { openSettings(Settings.ACTION_SETTINGS); }
+                  }, null);
+                  notif = makeTile("Notifications", new View.OnClickListener() {
+                      @Override public void onClick(View v) {
+                          hide();
+                          svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS);
+                      }
+                  }, null);
+                  power = makeTile("Power menu", new View.OnClickListener() {
+                      @Override public void onClick(View v) {
+                          hide();
+                          svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_POWER_DIALOG);
+                      }
+                  }, null);
+                  addRow(panel, wifi, bt);
+                  addRow(panel, torch, rotate);
+                  addRow(panel, data, plane);
+                  addRow(panel, loc, sett);
+                  addRow(panel, notif, power);
+
+                  label(panel, "Brightness");
+                  SeekBar br = new SeekBar(svc);
+                  br.setMax(255);
+                  br.setProgress(Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS, 128));
+                  br.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                          if (!fromUser) return;
+                          if (!Settings.System.canWrite(svc)) { openWriteSettings(); return; }
+                          Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE,
+                                  Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL);
+                          Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, Math.max(p, 1));
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar s) { }
+                      @Override public void onStopTrackingTouch(SeekBar s) { }
+                  });
+                  panel.addView(br);
+
+                  label(panel, "Volume");
+                  final AudioManager am = (AudioManager) svc.getSystemService(Context.AUDIO_SERVICE);
+                  SeekBar vol = new SeekBar(svc);
+                  vol.setMax(am.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+                  vol.setProgress(am.getStreamVolume(AudioManager.STREAM_MUSIC));
+                  vol.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                          if (fromUser) am.setStreamVolume(AudioManager.STREAM_MUSIC, p, 0);
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar s) { }
+                      @Override public void onStopTrackingTouch(SeekBar s) { }
+                  });
+                  panel.addView(vol);
+              }
+
+              // ---------- toggles ----------
+
+              private WifiManager wifiMgr() {
+                  return (WifiManager) svc.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+              }
+
+              private void toggleWifi() {
+                  boolean ok = false;
+                  try { ok = wifiMgr().setWifiEnabled(!wifiMgr().isWifiEnabled()); } catch (Exception ignored) { }
+                  if (!ok || Build.VERSION.SDK_INT >= 29) openSettings(Settings.ACTION_WIFI_SETTINGS);
+                  else refresh();
+              }
+
+              private void toggleBt() {
+                  BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
+                  if (ad == null) return;
+                  boolean ok = false;
+                  try { ok = ad.isEnabled() ? ad.disable() : ad.enable(); } catch (Exception ignored) { }
+                  if (!ok || Build.VERSION.SDK_INT >= 33) openSettings(Settings.ACTION_BLUETOOTH_SETTINGS);
+                  else refresh();
+              }
+
+              private void toggleTorch() {
+                  try {
+                      CameraManager cm = (CameraManager) svc.getSystemService(Context.CAMERA_SERVICE);
+                      cm.setTorchMode(cm.getCameraIdList()[0], !torchOn);
+                      torchOn = !torchOn;
+                  } catch (Exception ignored) { }
+                  refresh();
+              }
+
+              private void toggleRotate() {
+                  if (!Settings.System.canWrite(svc)) { openWriteSettings(); return; }
+                  ContentResolver cr = svc.getContentResolver();
+                  int cur = Settings.System.getInt(cr, Settings.System.ACCELEROMETER_ROTATION, 0);
+                  Settings.System.putInt(cr, Settings.System.ACCELEROMETER_ROTATION, 1 - cur);
+                  refresh();
+              }
+
+              // ---------- live status ----------
+
+              private void refresh() {
+                  if (!showing) return;
+                  ContentResolver cr = svc.getContentResolver();
+
+                  WifiManager wf = wifiMgr();
+                  boolean wOn = wf.isWifiEnabled();
+                  String ws = "Off";
+                  if (wOn) {
+                      WifiInfo i = wf.getConnectionInfo();
+                      String s = (i == null) ? null : i.getSSID();
+                      if (s == null || s.equals("<unknown ssid>") || s.equals("0x")) {
+                          ws = (i != null && i.getNetworkId() == -1) ? "Not connected" : "Connected";
+                      } else {
+                          ws = s.replace("\"", "");
+                      }
+                  }
+                  setTile(wifi, wOn, ws);
+
+                  updateBtText();
+                  queryBt();
+
+                  setTile(torch, torchOn, torchOn ? "On" : "Off");
+                  boolean rot = Settings.System.getInt(cr, Settings.System.ACCELEROMETER_ROTATION, 0) == 1;
+                  setTile(rotate, rot, rot ? "On" : "Off");
+                  setTile(data, false, "Tap to open");
+                  boolean ap = Settings.Global.getInt(cr, Settings.Global.AIRPLANE_MODE_ON, 0) == 1;
+                  setTile(plane, ap, ap ? "On" : "Off");
+                  boolean lo = Settings.Secure.getInt(cr, Settings.Secure.LOCATION_MODE, 0) != 0;
+                  setTile(loc, lo, lo ? "On" : "Off");
+                  setTile(sett, false, "Open all settings");
+                  setTile(notif, false, "Open panel");
+                  setTile(power, false, "Shut down, restart");
+              }
+
+              private void updateBtText() {
+                  BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
+                 
